@@ -1,0 +1,13 @@
+[project]
+name = "gcal-notifier"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-api-python-client",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+    "plyer",
+    "asyncio"
+]
