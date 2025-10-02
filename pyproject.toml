@@ -9,5 +9,6 @@ dependencies = [
     "google-auth-httplib2",
     "google-auth-oauthlib",
     "plyer",
-    "asyncio"
+    "asyncio",
+    "desktop-notifier>=6.2.0",
 ]
