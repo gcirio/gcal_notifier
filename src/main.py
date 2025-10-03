@@ -5,8 +5,9 @@ import os
 import pickle
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from desktop_notifier import DesktopNotifier
+from desktop_notifier import DesktopNotifier, Icon
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -19,7 +20,10 @@ UPDATE_INTERVAL = 10 * 60  # 10 minutes in seconds
 CALENDAR_IDS = ["gabriel.cirio@gmail.com", "gabriel.cirio@seddi.com"]
 NOTIFICATION_TIMEOUT = 1000
 
-notifier = DesktopNotifier(app_name="Google Calendar")
+notifier = DesktopNotifier(
+    app_name="Google Calendar",
+    app_icon=Icon(path=Path(__file__).parent.resolve() / "../notification.png"),
+)
 
 # Setup logging
 logging.basicConfig(
@@ -179,13 +183,15 @@ async def main():
                 _ = await notifier.send(
                     title=f"{summary}",
                     message=message,
-                    timeout=NOTIFICATION_TIMEOUT,
                     on_clicked=lambda: webbrowser.open(hangout_link_with_user),
+                    timeout=NOTIFICATION_TIMEOUT,
                 )
             else:
                 logging.info(f"Notification shown: {summary} at {start}")
                 _ = await notifier.send(
-                    title=f"{summary}", message=message, timeout=NOTIFICATION_TIMEOUT
+                    title=f"{summary}",
+                    message=message,
+                    timeout=NOTIFICATION_TIMEOUT,
                 )
 
         # Sleep until next notification or next scheduled update
