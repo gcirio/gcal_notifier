@@ -7,6 +7,8 @@ wheels/
 *.egg-info
 credentials.json
 token.pickle
+calendar_ids.txt
+gcal_notifier.log
 
 # Virtual environments
 .venv
