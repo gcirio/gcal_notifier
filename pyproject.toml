@@ -1,14 +1,13 @@
 [project]
 name = "gcal-notifier"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0"
+description = "A Python application that retrieves events from all your Google Calendars and displays notifications for upcoming events and reminders."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "google-api-python-client",
     "google-auth-httplib2",
     "google-auth-oauthlib",
-    "plyer",
     "asyncio",
     "desktop-notifier>=6.2.0",
 ]
