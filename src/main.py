@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import os
 import pickle
+import sys
 from datetime import datetime, timedelta, timezone
 
 from desktop_notifier import DesktopNotifier
@@ -18,6 +20,13 @@ CALENDAR_IDS = ["gabriel.cirio@gmail.com", "gabriel.cirio@seddi.com"]
 
 notifier = DesktopNotifier()
 
+# Setup logging
+logging.basicConfig(
+    filename="gcal_notifier.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
+
 
 # utility:
 async def print_all_calendar_ids(service):
@@ -30,6 +39,7 @@ async def print_all_calendar_ids(service):
 async def authenticate_google_calendar():
     """Authenticate and return the Google Calendar service."""
     creds = None
+    logging.info("Authenticating with Google Calendar API")
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "rb") as token:
             creds = pickle.load(token)
@@ -41,7 +51,7 @@ async def authenticate_google_calendar():
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "wb") as token:
             pickle.dump(creds, token)
-    service = build("calendar", "v3", credentials=creds)
+    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
     return service
 
 
@@ -50,6 +60,7 @@ async def get_upcoming_events(service, calendar_id):
     now = datetime.now(timezone.utc)
     time_min = now.isoformat()
     time_max = (now + timedelta(hours=24)).isoformat()
+    logging.info(f"Updating events for calendar: {calendar_id}")
     events_result = (
         service.events()
         .list(
@@ -162,11 +173,26 @@ async def main():
 
         # Send notifications
         for event, notify_time, note in notifications_to_send:
+            import webbrowser
+
             start = event["start"].get("dateTime", event["start"].get("date"))
             summary = event.get("summary", "No Title")
-            await notifier.send(
-                title=f"{note}", message=f"{summary} at {start}", timeout=10
-            )
+            hangout_link = event.get("hangoutLink")
+            message = f"{summary} at {start}"
+            if hangout_link:
+                message += f"\nJoin: {hangout_link}"
+                logging.info(
+                    f"Notification shown: {summary} at {start} (with hangout link)"
+                )
+                await notifier.send(
+                    title=f"{note}",
+                    message=message,
+                    timeout=10,
+                    on_click=lambda: webbrowser.open(hangout_link),
+                )
+            else:
+                logging.info(f"Notification shown: {summary} at {start}")
+                await notifier.send(title=f"{note}", message=message, timeout=10)
 
         # Update events list every 10 minutes
         # Sleep until next notification or update interval
@@ -181,4 +207,18 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Fatal error: {e}", exc_info=True)
+        try:
+            asyncio.run(
+                notifier.send(
+                    title="gcal_notifier crashed",
+                    message=f"Fatal error: {e}",
+                    timeout=10,
+                )
+            )
+        except Exception:
+            pass
+        sys.exit(1)
