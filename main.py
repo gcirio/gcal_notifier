@@ -16,13 +16,14 @@ from googleapiclient.discovery import build
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.pickle"
+CALENDAR_IDS_FILE = "calendar_ids.txt"
+NOTIFICATION_ICON_FILE = "notification.png"
 UPDATE_INTERVAL = 10 * 60  # 10 minutes in seconds
-CALENDAR_IDS = ["gabriel.cirio@gmail.com", "gabriel.cirio@seddi.com"]
 NOTIFICATION_TIMEOUT = 1000
 
 notifier = DesktopNotifier(
     app_name="Google Calendar",
-    app_icon=Icon(path=Path(__file__).parent.resolve() / "../notification.png"),
+    app_icon=Icon(path=Path(__file__).parent.resolve() / NOTIFICATION_ICON_FILE),
 )
 
 # Setup logging
@@ -106,10 +107,21 @@ async def main():
     # Track notifications sent: (event_id, notification_time)
     sent_notifications = set()
 
+    # Read calendar IDs from file at startup
+    def read_calendar_ids():
+        try:
+            with open(Path(__file__).parent.resolve() / CALENDAR_IDS_FILE, "r") as f:
+                return [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            logging.error(f"Failed to read calendar IDs: {e}")
+            return []
+
+    calendar_ids = read_calendar_ids()
+
     # Track last event update time
     last_update_time = datetime.now(timezone.utc)
     events.clear()
-    for calendar_id in CALENDAR_IDS:
+    for calendar_id in calendar_ids:
         events += await get_upcoming_events(service, calendar_id)
 
     while True:
@@ -214,7 +226,7 @@ async def main():
         now = datetime.now(timezone.utc)
         if now >= next_update_time:
             events.clear()
-            for calendar_id in CALENDAR_IDS:
+            for calendar_id in calendar_ids:
                 events += await get_upcoming_events(service, calendar_id)
             last_update_time = now
 
