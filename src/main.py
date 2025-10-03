@@ -17,6 +17,7 @@ CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.pickle"
 UPDATE_INTERVAL = 10 * 60  # 10 minutes in seconds
 CALENDAR_IDS = ["gabriel.cirio@gmail.com", "gabriel.cirio@seddi.com"]
+NOTIFICATION_TIMEOUT = -1
 
 notifier = DesktopNotifier()
 
@@ -76,15 +77,6 @@ async def get_upcoming_events(service, calendar_id):
     return events
 
 
-async def notify_event(event):
-    """Display a desktop notification for an event."""
-    start = event["start"].get("dateTime", event["start"].get("date"))
-    summary = event.get("summary", "No Title")
-    notification.notify(
-        title="Upcoming Event", message=f"{summary} at {start}", timeout=10
-    )
-
-
 def parse_event_time(start):
     """Parse event start time to always return an offset-aware datetime."""
     if "dateTime" in start:
@@ -110,14 +102,13 @@ async def main():
     # Track notifications sent: (event_id, notification_time)
     sent_notifications = set()
 
+    # Track last event update time
+    last_update_time = datetime.now(timezone.utc)
+    events.clear()
+    for calendar_id in CALENDAR_IDS:
+        events += await get_upcoming_events(service, calendar_id)
+
     while True:
-        events.clear()
-
-        for calendar_id in CALENDAR_IDS:
-            events += await get_upcoming_events(service, calendar_id)
-
-        # print(json.dumps(events, indent=2))
-
         now = datetime.now(timezone.utc)
         notifications_to_send = []
         next_notification_time = None
@@ -184,17 +175,18 @@ async def main():
                 logging.info(
                     f"Notification shown: {summary} at {start} (with hangout link)"
                 )
-                await notifier.send(
+                _ = await notifier.send(
                     title=f"{note}",
                     message=message,
-                    timeout=10,
-                    on_click=lambda: webbrowser.open(hangout_link),
+                    timeout=NOTIFICATION_TIMEOUT,
+                    on_clicked=lambda: webbrowser.open(hangout_link),
                 )
             else:
                 logging.info(f"Notification shown: {summary} at {start}")
-                await notifier.send(title=f"{note}", message=message, timeout=10)
+                _ = await notifier.send(
+                    title=f"{note}", message=message, timeout=NOTIFICATION_TIMEOUT
+                )
 
-        # Update events list every 10 minutes
         # Sleep until next notification or update interval
         sleep_seconds = UPDATE_INTERVAL
         if next_notification_time:
@@ -205,6 +197,14 @@ async def main():
                 sleep_seconds = min(sleep_seconds, sleep_until_next)
         await asyncio.sleep(sleep_seconds)
 
+        # Only update events if UPDATE_INTERVAL has passed
+        now = datetime.now(timezone.utc)
+        if (now - last_update_time).total_seconds() >= UPDATE_INTERVAL:
+            events.clear()
+            for calendar_id in CALENDAR_IDS:
+                events += await get_upcoming_events(service, calendar_id)
+            last_update_time = now
+
 
 if __name__ == "__main__":
     try:
@@ -212,11 +212,11 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Fatal error: {e}", exc_info=True)
         try:
-            asyncio.run(
+            _ = asyncio.run(
                 notifier.send(
                     title="gcal_notifier crashed",
                     message=f"Fatal error: {e}",
-                    timeout=10,
+                    timeout=NOTIFICATION_TIMEOUT,
                 )
             )
         except Exception:
