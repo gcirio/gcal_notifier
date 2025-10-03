@@ -17,9 +17,9 @@ CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.pickle"
 UPDATE_INTERVAL = 10 * 60  # 10 minutes in seconds
 CALENDAR_IDS = ["gabriel.cirio@gmail.com", "gabriel.cirio@seddi.com"]
-NOTIFICATION_TIMEOUT = -1
+NOTIFICATION_TIMEOUT = 1000
 
-notifier = DesktopNotifier()
+notifier = DesktopNotifier(app_name="Google Calendar")
 
 # Setup logging
 logging.basicConfig(
@@ -120,7 +120,7 @@ async def main():
             # 1. Notification at event start
             if start_time and (event_id, start_time) not in sent_notifications:
                 if now >= start_time and (now - start_time).total_seconds() < 60:
-                    notifications_to_send.append((event, start_time, "Event starting"))
+                    notifications_to_send.append((event, start_time, "Starting now"))
                     sent_notifications.add((event_id, start_time))
                 else:
                     if (
@@ -150,7 +150,7 @@ async def main():
                                 (
                                     event,
                                     reminder_time,
-                                    f"Reminder: {minutes} min before",
+                                    f"Starting in {minutes} minutes",
                                 )
                             )
                             sent_notifications.add((event_id, reminder_time))
@@ -169,37 +169,44 @@ async def main():
             start = event["start"].get("dateTime", event["start"].get("date"))
             summary = event.get("summary", "No Title")
             hangout_link = event.get("hangoutLink")
-            message = f"{summary} at {start}"
+            message = f"{note}"
             if hangout_link:
-                message += f"\nJoin: {hangout_link}"
+                hangout_link_with_user = f"{hangout_link}?pli=1&authuser=1"
+                message += f"\nClick to join the meeting..."
                 logging.info(
                     f"Notification shown: {summary} at {start} (with hangout link)"
                 )
                 _ = await notifier.send(
-                    title=f"{note}",
+                    title=f"{summary}",
                     message=message,
                     timeout=NOTIFICATION_TIMEOUT,
-                    on_clicked=lambda: webbrowser.open(hangout_link),
+                    on_clicked=lambda: webbrowser.open(hangout_link_with_user),
                 )
             else:
                 logging.info(f"Notification shown: {summary} at {start}")
                 _ = await notifier.send(
-                    title=f"{note}", message=message, timeout=NOTIFICATION_TIMEOUT
+                    title=f"{summary}", message=message, timeout=NOTIFICATION_TIMEOUT
                 )
 
-        # Sleep until next notification or update interval
+        # Sleep until next notification or next scheduled update
+        now = datetime.now(timezone.utc)
+        next_update_time = last_update_time + timedelta(seconds=UPDATE_INTERVAL)
+        sleep_until_update = (next_update_time - now).total_seconds()
         sleep_seconds = UPDATE_INTERVAL
         if next_notification_time:
-            sleep_until_next = (
-                next_notification_time - datetime.now(timezone.utc)
-            ).total_seconds()
+            sleep_until_next = (next_notification_time - now).total_seconds()
             if sleep_until_next > 0:
-                sleep_seconds = min(sleep_seconds, sleep_until_next)
-        await asyncio.sleep(sleep_seconds)
+                sleep_seconds = min(sleep_until_update, sleep_until_next)
+            else:
+                sleep_seconds = sleep_until_update
+        else:
+            sleep_seconds = sleep_until_update
+        if sleep_seconds > 0:
+            await asyncio.sleep(sleep_seconds)
 
-        # Only update events if UPDATE_INTERVAL has passed
+        # Only update events if UPDATE_INTERVAL has passed since last update
         now = datetime.now(timezone.utc)
-        if (now - last_update_time).total_seconds() >= UPDATE_INTERVAL:
+        if now >= next_update_time:
             events.clear()
             for calendar_id in CALENDAR_IDS:
                 events += await get_upcoming_events(service, calendar_id)
