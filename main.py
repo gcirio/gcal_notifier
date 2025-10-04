@@ -3,11 +3,11 @@ import json
 import logging
 import os
 import pickle
-import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from desktop_notifier import DesktopNotifier, Icon
+from desktop_notifier import DesktopNotifier, Icon, Urgency
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -22,7 +22,7 @@ UPDATE_INTERVAL = 10 * 60  # 10 minutes in seconds
 NOTIFICATION_TIMEOUT = 1000
 
 notifier = DesktopNotifier(
-    app_name="Google Calendar",
+    app_name="Google Calendar Notifier",
     app_icon=Icon(path=Path(__file__).parent.resolve() / NOTIFICATION_ICON_FILE),
 )
 
@@ -231,19 +231,40 @@ async def main():
             last_update_time = now
 
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logging.error(f"Fatal error: {e}", exc_info=True)
+def run_notifier():
+    while True:
         try:
-            _ = asyncio.run(
-                notifier.send(
-                    title="gcal_notifier crashed",
-                    message=f"Fatal error: {e}",
-                    timeout=NOTIFICATION_TIMEOUT,
+            asyncio.run(main())
+            break  # Exit if main() finishes normally
+        except SystemExit:
+            logging.info("SystemExit received, terminating app.")
+            break
+        except BaseException as e:
+            logging.error(f"Fatal error: {e}", exc_info=True)
+            restart_time = 5
+            try:
+                _ = asyncio.run(
+                    notifier.send(
+                        title=f"gcal_notifier crashed!\nWill restart in {restart_time} seconds...",
+                        message=f"Fatal error: {e}",
+                        timeout=NOTIFICATION_TIMEOUT,
+                        urgency=Urgency.Critical,
+                    )
                 )
-            )
-        except Exception:
-            pass
-        sys.exit(1)
+            except Exception:
+                pass
+            time.sleep(restart_time)  # Wait before restarting
+            try:
+                _ = asyncio.run(
+                    notifier.send(
+                        title="gcal_notifier",
+                        message="Restarting...",
+                        timeout=NOTIFICATION_TIMEOUT,
+                    )
+                )
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    run_notifier()
