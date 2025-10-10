@@ -35,10 +35,20 @@ This project uses [uv](https://github.com/astral-sh/uv) for package management. 
 1. In your project, go to **APIs & Services > Library**.
 2. Search for "Google Calendar API" and enable it.
 
-#### c. Configure OAuth Consent Screen
+#### c. Configure (and eventually Publish) OAuth Consent Screen
 
 1. Go to **APIs & Services > OAuth consent screen**.
+
+Then, either:
+
 2. Set up the consent screen (for personal use, set as "External" and add your email as a test user).
+
+**OR**
+
+2. Publish the app to remove the 7-day token revocation limit.
+   - In the OAuth consent screen, click "Publish App".
+   - This makes the app available for authentication, but only users with your credentials and calendar IDs can access your calendar.
+   - Publishing is necessary to prevent tokens from being revoked after 7 days.
 
 #### d. Create OAuth Credentials
 
@@ -51,6 +61,7 @@ This project uses [uv](https://github.com/astral-sh/uv) for package management. 
 
 - On first run, the app will prompt you to authenticate in your browser.
 - A `token.pickle` file will be created for future runs.
+- **Note:** If the app is not published, your authentication token will be revoked after 7 days. Publishing the app as described above is required for persistent access.
 
 ### 4. List Your Calendar IDs
 
