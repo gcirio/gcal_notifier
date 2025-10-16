@@ -3,10 +3,11 @@ import json
 import logging
 import os
 import pickle
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from desktop_notifier import DesktopNotifier, Icon, Urgency
+from desktop_notifier import Button, DesktopNotifier, Icon, Urgency
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -271,12 +272,16 @@ async def run_notifier():
             # clear last warning notification
             await clear_notification(notification_id)
 
-            # send restarting notification
+            # send restarting notification with "kill app" button
             try:
+                kill_button = Button(
+                    title="Click here to kill app!", on_pressed=lambda: sys.exit(0)
+                )
                 notification_id = await notifier.send(
                     title="gcal_notifier",
                     message="Restarting...",
                     timeout=NOTIFICATION_TIMEOUT,
+                    buttons=[kill_button],
                 )
             except Exception:
                 pass
