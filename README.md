@@ -15,7 +15,7 @@ A Python application that retrieves events from all your Google Calendars and di
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/gcirio/gcal_notifier.git
 cd gcal_notifier
 ```
 
@@ -55,11 +55,11 @@ Then, either:
 1. Go to **APIs & Services > Credentials**.
 2. Click **Create Credentials > OAuth client ID**.
 3. Choose "Desktop app" and create.
-4. Download the `credentials.json` file and place it in the `gcal_notifier` directory.
+4. Download the credentials json, rename it `credentials.json` and place it in the `gcal_notifier` directory.
 
 #### e. First Run Authentication
 
-- On first run, the app will prompt you to authenticate in your browser.
+- On first run, google will prompt you to authenticate in your browser.
 - A `token.pickle` file will be created for future runs.
 - **Note:** If the app is not published, your authentication token will be revoked after 7 days. Publishing the app as described above is required for persistent access.
 
@@ -83,6 +83,7 @@ Run the application from the project root:
 uv run main.py
 ```
 
+- On first run, google will prompt you to authenticate in your browser (see 3.e: "First Run Authentication").
 - The app will run in the background, periodically updating events and sending notifications.
 - Logs are written to `gcal_notifier.log`.
 
@@ -97,7 +98,7 @@ uv run main.py
 - **Notification Timeout:** Change the `NOTIFICATION_TIMEOUT` variable in `main.py`.
 - **Update Interval:** Change the `UPDATE_INTERVAL` variable in `main.py`.
 - **Calendar List:** Edit `calendar_ids.txt`.
-- **Notification Icon:** Change `notification.png` with whatever you want to use.
+- **Notification Icon:** Replace `notification.png` with whatever you want to use.
 
 ## License
 
