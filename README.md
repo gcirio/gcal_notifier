@@ -65,14 +65,21 @@ Then, either:
 
 ### 4. List Your Calendar IDs
 
-Create a file named `calendar_ids.txt` in the `gcal_notifier` directory.
-Add one calendar ID per line.
-You can find your calendar IDs in the Google Calendar web UI under "Settings and sharing" for each calendar.
+Create a file named `calendar_ids.txt` in the `gcal_notifier` directory, with one calendar ID per line. You can find each calendar ID in the Google Calendar web UI under "Settings and sharing".
+
+The calendar also determines which browser google account is selected when you click a Google Meet notification:
+
+- If the calendar ID is an ordinary email address, that address is used automatically.
+- To choose a different account, use `calendar-id | account-email`. This explicit account overrides any account inferred from the calendar ID.
+- If no account can be inferred or is explicitly configured, the original meeting URL is opened unchanged.
 
 **Example:**
-```
-your.account@gmail.com
-another_calendar_id@group.calendar.google.com
+
+```text
+personal@gmail.com
+you@company.com
+team-id@group.calendar.google.com | you@company.com
+shared-owner@example.com | personal@gmail.com
 ```
 
 ## Usage

@@ -3,10 +3,12 @@ import json
 import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parseaddr
 from functools import partial
 from logging.handlers import RotatingFileHandler
 from math import ceil
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from desktop_notifier import Button, Capability, DesktopNotifier, Icon, Urgency
@@ -161,20 +163,85 @@ async def get_upcoming_events(service, calendar_id):
     return await service.get_events(calendar_id)
 
 
-def read_calendar_ids():
+def is_account_email(value):
+    if (
+        not isinstance(value, str)
+        or any(char.isspace() for char in value)
+        or "|" in value
+    ):
+        return False
+    name, address = parseaddr(value)
+    if name or address != value or value.count("@") != 1:
+        return False
+    local, domain = value.rsplit("@", 1)
+    domain = domain.casefold()
+    return bool(
+        local
+        and "." in domain
+        and all(domain.split("."))
+        and domain != "calendar.google.com"
+        and not domain.endswith(".calendar.google.com")
+    )
+
+
+def read_calendar_accounts():
     path = APP_DIR / CALENDAR_IDS_FILE
+    accounts = {}
     try:
         with open(path, "r", encoding="utf-8") as stream:
-            calendar_ids = list(
-                dict.fromkeys(line.strip() for line in stream if line.strip())
-            )
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                fields = [field.strip() for field in line.split("|")]
+                calendar_id = fields[0]
+                if len(fields) > 2 or not calendar_id:
+                    raise CalendarConfigurationError(
+                        f"Invalid calendar entry on line {line_number} of {path}. "
+                        "Use calendar-id or calendar-id | account-email."
+                    )
+                if len(fields) == 2:
+                    account = fields[1]
+                    if not is_account_email(account):
+                        raise CalendarConfigurationError(
+                            f"Invalid meeting account email on line {line_number} of {path}."
+                        )
+                else:
+                    account = calendar_id if is_account_email(calendar_id) else None
+                if calendar_id in accounts and accounts[calendar_id] != account:
+                    raise CalendarConfigurationError(
+                        f"Conflicting meeting accounts on line {line_number} of {path}."
+                    )
+                accounts[calendar_id] = account
     except (OSError, UnicodeError) as e:
         raise CalendarConfigurationError(
             f"Cannot read calendar IDs from {path}."
         ) from e
-    if not calendar_ids:
+    if not accounts:
         raise CalendarConfigurationError(f"No calendar IDs configured in {path}.")
-    return calendar_ids
+    for calendar_id, account in accounts.items():
+        if account is None:
+            logging.warning(
+                "No meeting account configured for calendar %s; original meeting URLs will be used.",
+                calendar_id,
+            )
+    return accounts
+
+
+def read_calendar_ids():
+    return list(read_calendar_accounts())
+
+
+def build_meeting_url(url: str, account_email: str | None) -> str:
+    if account_email is None:
+        return url
+    parts = urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key != "authuser"
+    ]
+    query.append(("authuser", account_email))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def prune_sent_notifications(sent_notifications, now):
@@ -317,7 +384,8 @@ async def main(sent_notifications=None):
     calendar_fetch_times = {}
     calendar_retry_delays = {}
 
-    calendar_ids = read_calendar_ids()
+    calendar_accounts = read_calendar_accounts()
+    calendar_ids = list(calendar_accounts)
     calendar_update_times: dict[str, datetime | None] = {
         calendar_id: datetime.now(timezone.utc) for calendar_id in calendar_ids
     }
@@ -500,10 +568,20 @@ async def main(sent_notifications=None):
                     message = f"Starting in {minutes} minutes"
                 hangout_link = event.get("hangoutLink")
                 on_clicked = None
-                if hangout_link:
-                    hangout_link_with_user = f"{hangout_link}?pli=1&authuser=1"
-                    message += "\nClick to join the meeting..."
-                    on_clicked = lambda url=hangout_link_with_user: webbrowser.open(url)
+                if isinstance(hangout_link, str) and hangout_link:
+                    try:
+                        meeting_url = build_meeting_url(
+                            hangout_link, calendar_accounts[key[0]]
+                        )
+                    except ValueError:
+                        logging.warning(
+                            "Ignoring invalid meeting URL for event %s in calendar %s.",
+                            key[1],
+                            key[0],
+                        )
+                    else:
+                        message += "\nClick to join the meeting..."
+                        on_clicked = lambda url=meeting_url: webbrowser.open(url)
                 try:
                     await send_event_notification(
                         title=summary,
