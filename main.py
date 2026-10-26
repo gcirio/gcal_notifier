@@ -2,10 +2,12 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import partial
+from logging.handlers import RotatingFileHandler
 from math import ceil
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from desktop_notifier import Button, Capability, DesktopNotifier, Icon, Urgency
 from googleapiclient.errors import HttpError
@@ -18,6 +20,8 @@ from google_calendar import (
 
 # Constants
 
+APP_DIR = Path(__file__).parent.resolve()
+LOG_FILE = APP_DIR / "gcal_notifier.log"
 CALENDAR_IDS_FILE = "calendar_ids.txt"
 NOTIFICATION_ICON_FILE = "notification.png"
 UPDATE_INTERVAL = 10 * 60  # 10 minutes in seconds
@@ -30,12 +34,23 @@ notifier = DesktopNotifier(
     app_icon=Icon(path=Path(__file__).parent.resolve() / NOTIFICATION_ICON_FILE),
 )
 
-# Setup logging
-logging.basicConfig(
-    filename="gcal_notifier.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
+
+def configure_logging():
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+        delay=True,
+    )
+    logging.basicConfig(
+        handlers=[handler],
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
+
+
+configure_logging()
 
 
 # utility:
@@ -146,18 +161,151 @@ async def get_upcoming_events(service, calendar_id):
     return await service.get_events(calendar_id)
 
 
+def read_calendar_ids():
+    path = APP_DIR / CALENDAR_IDS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            calendar_ids = list(
+                dict.fromkeys(line.strip() for line in stream if line.strip())
+            )
+    except (OSError, UnicodeError) as e:
+        raise CalendarConfigurationError(
+            f"Cannot read calendar IDs from {path}."
+        ) from e
+    if not calendar_ids:
+        raise CalendarConfigurationError(f"No calendar IDs configured in {path}.")
+    return calendar_ids
+
+
+def prune_sent_notifications(sent_notifications, now):
+    cutoff = now - timedelta(seconds=UPDATE_INTERVAL)
+    sent_notifications.difference_update(
+        {key for key in sent_notifications if key[2] <= cutoff}
+    )
+
+
+async def send_event_notification(**kwargs):
+    """A returned identifier alone does not prove the backend dispatched an alert."""
+    dispatched = asyncio.Event()
+    acknowledge_dispatch = partial(
+        asyncio.get_running_loop().call_soon_threadsafe, dispatched.set
+    )
+    async with asyncio.timeout(NOTIFICATION_DISPATCH_TIMEOUT):
+        capabilities = await notifier.get_capabilities()
+        if Capability.ON_DISPATCHED not in capabilities:
+            raise RuntimeError("The notification service cannot acknowledge dispatch.")
+        notification_id = await notifier.send(
+            on_dispatched=acknowledge_dispatch, **kwargs
+        )
+        if not notification_id:
+            raise RuntimeError("The event notification could not be dispatched.")
+        await dispatched.wait()
+    return notification_id
+
+
 def parse_event_time(start):
-    """Parse event start time to always return an offset-aware datetime."""
+    """Parse an aware instant without guessing a timezone for timed events."""
+    if not isinstance(start, dict):
+        raise ValueError("Event time must be an object.")
     if "dateTime" in start:
         dt_str = start["dateTime"]
+        if not isinstance(dt_str, str) or not dt_str:
+            raise ValueError("Event dateTime must be a nonempty string.")
+        if not any(separator in dt_str for separator in ("T", "t", " ")):
+            raise ValueError("Event dateTime must include both a date and a time.")
         if dt_str.endswith("Z"):
             dt_str = dt_str.replace("Z", "+00:00")
-        return datetime.fromisoformat(dt_str)
+        parsed = datetime.fromisoformat(dt_str)
+        if parsed.utcoffset() is None:
+            zone_name = start.get("timeZone")
+            if not isinstance(zone_name, str) or not zone_name:
+                raise ValueError("Timed events require an offset or explicit timezone.")
+            try:
+                zone = ZoneInfo(zone_name)
+            except (ZoneInfoNotFoundError, ValueError) as e:
+                raise ValueError("Invalid event timezone.") from e
+            parsed = parsed.replace(tzinfo=zone)
+            if parsed.utcoffset() != parsed.replace(fold=1).utcoffset():
+                raise ValueError(
+                    "Ambiguous or nonexistent event time requires an explicit offset."
+                )
+        return parsed
     elif "date" in start:
-        # All-day event, treat as UTC midnight
-        return datetime.fromisoformat(start["date"]).replace(tzinfo=timezone.utc)
+        date_str = start["date"]
+        if not isinstance(date_str, str):
+            raise ValueError("All-day event date must be a string.")
+        day = date.fromisoformat(date_str)
+        # Preserve the existing UTC-midnight policy for all-day events.
+        return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     else:
         return None
+
+
+def event_notification_times(event, calendar_id):
+    if not isinstance(event, dict):
+        raise ValueError("Event must be an object.")
+    event_id = event.get("id")
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ValueError("Event must have a nonempty string ID.")
+    start_time = parse_event_time(event.get("start"))
+    if start_time is None:
+        raise ValueError("Event start time is missing.")
+    # Scheduling arithmetic must measure elapsed time, not DST wall-clock time.
+    try:
+        start_instant = start_time.astimezone(timezone.utc)
+    except OverflowError as e:
+        raise ValueError("Event time is outside the supported UTC range.") from e
+    notification_times = [start_instant]
+    reminders = event.get("reminders", {})
+    if not isinstance(reminders, dict) or not isinstance(
+        reminders.get("useDefault", True), bool
+    ):
+        logging.warning(
+            "Ignoring invalid reminders for event %s in calendar %s.",
+            event_id,
+            calendar_id,
+        )
+        return start_time, notification_times
+    if reminders.get("useDefault", True):
+        return start_time, notification_times
+    overrides = reminders.get("overrides", [])
+    if not isinstance(overrides, list):
+        logging.warning(
+            "Ignoring invalid reminder overrides for event %s in calendar %s.",
+            event_id,
+            calendar_id,
+        )
+        return start_time, notification_times
+    for override in overrides:
+        if not isinstance(override, dict) or override.get("method") not in (
+            "popup",
+            "email",
+        ):
+            logging.warning(
+                "Ignoring invalid reminder for event %s in calendar %s.",
+                event_id,
+                calendar_id,
+            )
+            continue
+        if override["method"] != "popup":
+            continue
+        minutes = override.get("minutes")
+        if type(minutes) is not int or not 0 <= minutes <= 40320:
+            logging.warning(
+                "Ignoring invalid popup reminder for event %s in calendar %s.",
+                event_id,
+                calendar_id,
+            )
+            continue
+        try:
+            notification_times.append(start_instant - timedelta(minutes=minutes))
+        except OverflowError:
+            logging.warning(
+                "Ignoring out-of-range reminder for event %s in calendar %s.",
+                event_id,
+                calendar_id,
+            )
+    return start_time, notification_times
 
 
 async def main(sent_notifications=None):
@@ -168,15 +316,6 @@ async def main(sent_notifications=None):
     events_by_calendar = {}
     calendar_fetch_times = {}
     calendar_retry_delays = {}
-
-    # Read calendar IDs from file at startup
-    def read_calendar_ids():
-        try:
-            with open(Path(__file__).parent.resolve() / CALENDAR_IDS_FILE, "r") as f:
-                return [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            logging.error(f"Failed to read calendar IDs: {e}")
-            return []
 
     calendar_ids = read_calendar_ids()
     calendar_update_times: dict[str, datetime | None] = {
@@ -190,6 +329,7 @@ async def main(sent_notifications=None):
     try:
         authentication_task = asyncio.create_task(authenticate_google_calendar(client))
         while True:
+            prune_sent_notifications(sent_notifications, datetime.now(timezone.utc))
             if authentication_task is not None and authentication_task.done():
                 authentication_task.result()
                 authentication_task = None
@@ -272,32 +412,42 @@ async def main(sent_notifications=None):
             # Deliver cached deadlines even while a request or sign-in is pending.
             for calendar_id, events in events_by_calendar.items():
                 for event in events:
-                    current_event_ids.add((calendar_id, event["id"]))
-                    start_time = parse_event_time(event["start"])
-                    if not start_time:
+                    event_id = event.get("id") if isinstance(event, dict) else None
+                    if isinstance(event_id, str) and event_id:
+                        current_event_ids.add((calendar_id, event_id))
+                    if isinstance(event, dict) and event.get("status") == "cancelled":
                         continue
-                    notification_times = [start_time]
-                    reminders = event.get("reminders", {})
-                    overrides = (
-                        reminders.get("overrides", [])
-                        if not reminders.get("useDefault", True)
-                        else []
-                    )
-                    for override in overrides:
-                        if override.get("method") == "popup":
-                            notification_times.append(
-                                start_time
-                                - timedelta(minutes=override.get("minutes", 0))
-                            )
+                    try:
+                        _, notification_times = event_notification_times(
+                            event, calendar_id
+                        )
+                    except ValueError as e:
+                        logging.warning(
+                            "Skipping invalid event %s in calendar %s: %s",
+                            event_id if isinstance(event_id, str) else "<unknown>",
+                            calendar_id,
+                            e,
+                        )
+                        continue
                     for notify_time in notification_times:
-                        notification_events[(calendar_id, event["id"], notify_time)] = (
+                        notification_events[(calendar_id, event_id, notify_time)] = (
                             event
                         )
 
             for key, (_, _, event) in list(notification_retries.items()):
                 if key in notification_events:
                     continue
-                end_time = parse_event_time(event.get("end", {}))
+                try:
+                    end_time = parse_event_time(event.get("end", {}))
+                except ValueError as e:
+                    logging.warning(
+                        "Dropping pending notification for event %s in calendar %s: %s",
+                        key[1],
+                        key[0],
+                        e,
+                    )
+                    notification_retries.pop(key)
+                    continue
                 # Ended events can leave the query while their delivery is pending.
                 if (
                     calendar_update_times[key[0]] is not None
@@ -317,7 +467,9 @@ async def main(sent_notifications=None):
                 notify_time = key[2]
                 now = datetime.now(timezone.utc)
                 # Catch up for one update interval, but do not replay older alerts.
-                expires_at = notify_time + timedelta(seconds=UPDATE_INTERVAL)
+                expires_at = notify_time.astimezone(timezone.utc) + timedelta(
+                    seconds=UPDATE_INTERVAL
+                )
                 if now >= expires_at:
                     notification_retries.pop(key, None)
                     continue
@@ -335,7 +487,9 @@ async def main(sent_notifications=None):
                 if not start_time:
                     continue
                 start = event["start"].get("dateTime", event["start"].get("date"))
-                summary = event.get("summary", "No Title")
+                summary = event.get("summary")
+                if not isinstance(summary, str) or not summary:
+                    summary = "No Title"
                 if now >= start_time:
                     minutes = int((now - start_time).total_seconds() // 60)
                     message = (
@@ -351,7 +505,7 @@ async def main(sent_notifications=None):
                     message += "\nClick to join the meeting..."
                     on_clicked = lambda url=hangout_link_with_user: webbrowser.open(url)
                 try:
-                    await notifier.send(
+                    await send_event_notification(
                         title=summary,
                         message=message,
                         on_clicked=on_clicked,
@@ -371,7 +525,7 @@ async def main(sent_notifications=None):
                 else:
                     sent_notifications.add(key)
                     notification_retries.pop(key, None)
-                    logging.info(f"Notification shown: {summary} at {start}")
+                    logging.info(f"Notification dispatched: {summary} at {start}")
 
             if fetch_task is not None and fetch_task.done():
                 continue

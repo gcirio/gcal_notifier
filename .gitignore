@@ -11,6 +11,7 @@ token.json
 .token.json.*.tmp
 calendar_ids.txt
 gcal_notifier.log
+gcal_notifier.log.*
 
 # Virtual environments
 .venv
