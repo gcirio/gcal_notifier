@@ -7,6 +7,8 @@ wheels/
 *.egg-info
 credentials.json
 token.pickle
+token.json
+.token.json.*.tmp
 calendar_ids.txt
 gcal_notifier.log
 
