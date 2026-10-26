@@ -5,12 +5,14 @@ import os
 import pickle
 import sys
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from pathlib import Path
 
 from desktop_notifier import Button, DesktopNotifier, Icon, Urgency
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Constants
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
@@ -97,16 +99,15 @@ def parse_event_time(start):
         return None
 
 
-async def main():
+async def main(sent_notifications=None):
     """Main function to run the notifier."""
     service = await authenticate_google_calendar()
-    event_notifications = []
-    events = []
-
-    # Initial fetch of events from all calendars
-
-    # Track notifications sent: (event_id, notification_time)
-    sent_notifications = set()
+    if sent_notifications is None:
+        sent_notifications = set()
+    notification_retries = {}
+    events_by_calendar = {}
+    calendar_fetch_times = {}
+    calendar_retry_delays = {}
 
     # Read calendar IDs from file at startup
     def read_calendar_ids():
@@ -118,118 +119,189 @@ async def main():
             return []
 
     calendar_ids = read_calendar_ids()
-
-    # Track last event update time
-    last_update_time = datetime.now(timezone.utc)
-    events.clear()
-    for calendar_id in calendar_ids:
-        events += await get_upcoming_events(service, calendar_id)
+    calendar_update_times: dict[str, datetime | None] = {
+        calendar_id: datetime.now(timezone.utc) for calendar_id in calendar_ids
+    }
 
     while True:
-        now = datetime.now(timezone.utc)
-        notifications_to_send = []
-        next_notification_time = None
+        wake_times = []
+        notification_events = {}
+        current_event_ids = set()
 
-        for event in events:
-            event_id = event["id"]
-            start_time = parse_event_time(event["start"])
+        # Deliver cached events before a refresh can remove events missed during sleep.
+        for calendar_id, events in events_by_calendar.items():
+            for event in events:
+                current_event_ids.add((calendar_id, event["id"]))
+                start_time = parse_event_time(event["start"])
+                if not start_time:
+                    continue
+                notification_times = [start_time]
+                reminders = event.get("reminders", {})
+                overrides = (
+                    reminders.get("overrides", [])
+                    if not reminders.get("useDefault", True)
+                    else []
+                )
+                for override in overrides:
+                    if override.get("method") == "popup":
+                        notification_times.append(
+                            start_time - timedelta(minutes=override.get("minutes", 0))
+                        )
+                for notify_time in notification_times:
+                    notification_events[(calendar_id, event["id"], notify_time)] = event
 
-            # 1. Notification at event start
-            if start_time and (event_id, start_time) not in sent_notifications:
-                if now >= start_time and (now - start_time).total_seconds() < 60:
-                    notifications_to_send.append((event, start_time, "Starting now"))
-                    sent_notifications.add((event_id, start_time))
-                else:
-                    if (
-                        not next_notification_time
-                        or start_time < next_notification_time
-                    ):
-                        if start_time > now:
-                            next_notification_time = start_time
+        for key, (_, _, event) in list(notification_retries.items()):
+            if key in notification_events:
+                continue
+            end_time = parse_event_time(event.get("end", {}))
+            # Ended events fall outside the API query, but their delivery may be pending.
+            if (
+                calendar_update_times[key[0]] is not None
+                and key[:2] not in current_event_ids
+                and end_time is not None
+                and end_time <= calendar_fetch_times[key[0]]
+            ):
+                notification_events[key] = event
+            else:
+                notification_retries.pop(key)
 
-            # 2. Notifications for popup reminders
-            reminders = event.get("reminders", {})
-            overrides = (
-                reminders.get("overrides", [])
-                if not reminders.get("useDefault", True)
-                else []
+        for key, event in notification_events.items():
+            if key in sent_notifications:
+                continue
+            notify_time = key[2]
+            now = datetime.now(timezone.utc)
+            # Catch up for one update interval, but do not replay older alerts.
+            expires_at = notify_time + timedelta(seconds=UPDATE_INTERVAL)
+            if now >= expires_at:
+                notification_retries.pop(key, None)
+                continue
+            retry_time, retry_delay, _ = notification_retries.get(
+                key, (notify_time, RESTART_TIME, event)
             )
-            for override in overrides:
-                if override.get("method") == "popup":
-                    minutes = override.get("minutes", 0)
-                    reminder_time = start_time - timedelta(minutes=minutes)
-                    if (event_id, reminder_time) not in sent_notifications:
-                        if (
-                            now >= reminder_time
-                            and (now - reminder_time).total_seconds() < 60
-                        ):
-                            notifications_to_send.append(
-                                (
-                                    event,
-                                    reminder_time,
-                                    f"Starting in {minutes} minutes",
-                                )
-                            )
-                            sent_notifications.add((event_id, reminder_time))
-                        else:
-                            if (
-                                not next_notification_time
-                                or reminder_time < next_notification_time
-                            ):
-                                if reminder_time > now:
-                                    next_notification_time = reminder_time
+            next_attempt = max(notify_time, retry_time)
+            if now < next_attempt:
+                wake_times.append(min(next_attempt, expires_at))
+                continue
 
-        # Send notifications
-        for event, notify_time, note in notifications_to_send:
             import webbrowser
 
+            start_time = parse_event_time(event["start"])
+            if not start_time:
+                continue
             start = event["start"].get("dateTime", event["start"].get("date"))
             summary = event.get("summary", "No Title")
+            if now >= start_time:
+                minutes = int((now - start_time).total_seconds() // 60)
+                message = (
+                    f"Started {minutes} minutes ago" if minutes else "Starting now"
+                )
+            else:
+                minutes = ceil((start_time - now).total_seconds() / 60)
+                message = f"Starting in {minutes} minutes"
             hangout_link = event.get("hangoutLink")
-            message = f"{note}"
+            on_clicked = None
             if hangout_link:
                 hangout_link_with_user = f"{hangout_link}?pli=1&authuser=1"
-                message += f"\nClick to join the meeting..."
-                logging.info(
-                    f"Notification shown: {summary} at {start} (with hangout link)"
-                )
-                _ = await notifier.send(
-                    title=f"{summary}",
+                message += "\nClick to join the meeting..."
+                on_clicked = lambda url=hangout_link_with_user: webbrowser.open(url)
+            try:
+                await notifier.send(
+                    title=summary,
                     message=message,
-                    on_clicked=lambda: webbrowser.open(hangout_link_with_user),
+                    on_clicked=on_clicked,
                     timeout=NOTIFICATION_TIMEOUT,
                 )
+            except Exception as e:
+                logging.error(f"Failed to send notification for {summary}: {e}")
+                next_retry = datetime.now(timezone.utc) + timedelta(seconds=retry_delay)
+                notification_retries[key] = (
+                    next_retry,
+                    min(retry_delay * 2, UPDATE_INTERVAL),
+                    event,
+                )
+                wake_times.append(min(next_retry, expires_at))
             else:
+                sent_notifications.add(key)
+                notification_retries.pop(key, None)
                 logging.info(f"Notification shown: {summary} at {start}")
-                _ = await notifier.send(
-                    title=f"{summary}",
-                    message=message,
-                    timeout=NOTIFICATION_TIMEOUT,
-                )
 
-        # Sleep until next notification or next scheduled update
-        now = datetime.now(timezone.utc)
-        next_update_time = last_update_time + timedelta(seconds=UPDATE_INTERVAL)
-        sleep_until_update = (next_update_time - now).total_seconds()
-        sleep_seconds = UPDATE_INTERVAL
-        if next_notification_time:
-            sleep_until_next = (next_notification_time - now).total_seconds()
-            if sleep_until_next > 0:
-                sleep_seconds = min(sleep_until_update, sleep_until_next)
+        refresh_attempted = False
+        for calendar_id, update_time in sorted(
+            (
+                (calendar_id, update_time)
+                for calendar_id, update_time in calendar_update_times.items()
+                if update_time is not None
+            ),
+            key=lambda item: item[1],
+        ):
+            if datetime.now(timezone.utc) < update_time:
+                break
+            refresh_attempted = True
+            refresh_started = datetime.now(timezone.utc)
+            try:
+                events_by_calendar[calendar_id] = await get_upcoming_events(
+                    service, calendar_id
+                )
+            except Exception as e:
+                permanent_error = isinstance(e, HttpError) and (
+                    e.resp.status in (400, 401, 404)
+                    or (
+                        e.resp.status == 403
+                        and any(
+                            isinstance(detail, dict)
+                            and detail.get("reason")
+                            in (
+                                "forbidden",
+                                "insufficientPermissions",
+                                "accessNotConfigured",
+                                "forbiddenForNonOrganizer",
+                                "notACalendarUser",
+                                "requiredAccessLevel",
+                            )
+                            for detail in e.error_details
+                        )
+                    )
+                )
+                if permanent_error:
+                    calendar_update_times[calendar_id] = None
+                    events_by_calendar.pop(calendar_id, None)
+                    logging.error(
+                        f"Calendar {calendar_id} is unavailable: {e}. "
+                        "Skipping it until the app restarts."
+                    )
+                else:
+                    retry_delay = calendar_retry_delays.get(calendar_id, RESTART_TIME)
+                    calendar_update_times[calendar_id] = datetime.now(
+                        timezone.utc
+                    ) + timedelta(seconds=retry_delay)
+                    calendar_retry_delays[calendar_id] = min(
+                        retry_delay * 2, UPDATE_INTERVAL
+                    )
+                    logging.error(
+                        f"Failed to update calendar {calendar_id}: {e}. "
+                        f"Retrying in {retry_delay} seconds."
+                    )
             else:
-                sleep_seconds = sleep_until_update
-        else:
-            sleep_seconds = sleep_until_update
+                calendar_fetch_times[calendar_id] = refresh_started
+                calendar_retry_delays.pop(calendar_id, None)
+                calendar_update_times[calendar_id] = datetime.now(
+                    timezone.utc
+                ) + timedelta(seconds=UPDATE_INTERVAL)
+            break
+
+        # Reevaluate between fetches, before another calendar's cache is replaced.
+        if refresh_attempted:
+            continue
+        wake_times.extend(
+            update_time
+            for update_time in calendar_update_times.values()
+            if update_time is not None
+        )
+        now = datetime.now(timezone.utc)
+        wake_times.append(now + timedelta(seconds=UPDATE_INTERVAL))
+        sleep_seconds = (min(wake_times) - now).total_seconds()
         if sleep_seconds > 0:
             await asyncio.sleep(sleep_seconds)
-
-        # Only update events if UPDATE_INTERVAL has passed since last update
-        now = datetime.now(timezone.utc)
-        if now >= next_update_time:
-            events.clear()
-            for calendar_id in calendar_ids:
-                events += await get_upcoming_events(service, calendar_id)
-            last_update_time = now
 
 
 async def clear_notification(notification_id: str):
@@ -242,9 +314,10 @@ async def clear_notification(notification_id: str):
 
 async def run_notifier():
     notification_id = ""
+    sent_notifications = set()
     while True:
         try:
-            await main()
+            await main(sent_notifications)
             break  # Exit if main() finishes normally
         except SystemExit:
             logging.info("SystemExit received, terminating app.")
