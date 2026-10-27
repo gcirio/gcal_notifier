@@ -8,6 +8,7 @@ dependencies = [
     "google-api-python-client",
     "google-auth-httplib2",
     "google-auth-oauthlib",
-    "asyncio",
     "desktop-notifier>=6.2.0",
+    "google-auth>=2.41.1",
+    "httplib2>=0.31.0",
 ]
